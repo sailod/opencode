@@ -4,6 +4,7 @@ export * as Watcher from "./watcher"
 import { createWrapper } from "@parcel/watcher/wrapper"
 import type ParcelWatcher from "@parcel/watcher"
 import { Cause, Context, Effect, Layer, Schema } from "effect"
+import fs from "fs"
 import path from "path"
 import { Config } from "../config"
 import { EventV2 } from "../event"
@@ -80,13 +81,15 @@ export const layer = Layer.effect(
 
     yield* Effect.logInfo("watcher backend", { directory: location.directory, platform: process.platform, backend })
     const events = yield* EventV2.Service
-    const fs = yield* FSUtil.Service
+    const fsService = yield* FSUtil.Service
     const git = yield* Git.Service
     const context = yield* Effect.context()
     const runFork = Effect.runForkWith(context)
     const subscriptions: ParcelWatcher.AsyncSubscription[] = []
     yield* Effect.addFinalizer(() =>
-      Effect.promise(() => Promise.allSettled(subscriptions.map((subscription) => subscription.unsubscribe()))),
+      Effect.promise(() =>
+        Promise.allSettled(subscriptions.map((subscription) => subscription.unsubscribe().catch(() => {}))),
+      ),
     )
 
     const callback: ParcelWatcher.SubscribeCallback = (_error, updates) => {
@@ -119,14 +122,40 @@ export const layer = Layer.effect(
     }
 
     if (location.vcs?.type === "git") {
-      const resolved = yield* git.dir(location.directory)
-      const vcs = resolved ? yield* fs.realPath(resolved).pipe(Effect.catch(() => Effect.succeed(resolved))) : undefined
-      if (vcs && !config.includes(".git") && !config.includes(vcs) && (!resolved || !config.includes(resolved))) {
-        const ignore = (yield* fs.readDirectoryEntries(vcs).pipe(Effect.catch(() => Effect.succeed([])))).flatMap(
-          (entry) => (entry.name === "HEAD" ? [] : [entry.name]),
-        )
-        yield* Effect.forkScoped(subscribe(vcs, ignore))
-      }
+      yield* Effect.forkScoped(
+        Effect.gen(function* () {
+          const resolved = yield* git.dir(location.directory)
+          const vcs = resolved
+            ? yield* fsService.realPath(resolved).pipe(Effect.catch(() => Effect.succeed(resolved)))
+            : undefined
+          if (!vcs || config.includes(".git") || config.includes(vcs) || (resolved && config.includes(resolved)))
+            return
+          const head = path.join(vcs, "HEAD")
+          if (!fs.existsSync(head)) return
+
+          let prev = ""
+          try { prev = fs.readFileSync(head, "utf8") } catch {}
+
+          fs.watchFile(head, { interval: 2000 }, () => {
+            try {
+              const next = fs.readFileSync(head, "utf8")
+              if (next !== prev) {
+                prev = next
+                runFork(events.publish(Event.Updated, { file: head, event: "change" }))
+              }
+            } catch {}
+          })
+
+          yield* Effect.addFinalizer(() => Effect.sync(() => fs.unwatchFile(head)))
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("watcher: git HEAD tracking failed, continuing without git HEAD tracking", {
+              directory: location.directory,
+              cause: Cause.pretty(cause),
+            }),
+          ),
+        ),
+      )
     }
 
     return Service.of({})
